@@ -15,7 +15,7 @@ import tempfile
 # 初始化主視窗 (移至最上方，統一管理)
 root = tk.Tk()
 root.title("圖片 轉 SVG 工具")
-root.geometry("850x600")
+root.geometry("1000x700") # 加大視窗以容納新控制項
 
 # 檢查並安裝必要套件 (Pillow, scikit-image, numpy, rdp)
 try:
@@ -144,6 +144,35 @@ if not potrace_path:
         messagebox.showerror("缺少元件", "找不到 potrace.exe。\n\n請手動下載 Potrace 並將其放置於程式目錄下的 potrace 資料夾中。")
         sys.exit(1)
 
+# --- 核心影像處理邏輯 (新增局部閾值支援) ---
+
+def generate_binary_mask(img_pil, global_thresh, region_list):
+    """
+    產生二值化遮罩，支援全域閾值與局部區域閾值混合
+    img_pil: PIL Image (RGB or L)
+    global_thresh: float (0.0 - 1.0)
+    region_list: list of dict {'coords': (x1, y1, x2, y2), 'threshold': float}
+    """
+    # 轉為灰階並正規化為 0.0-1.0
+    arr = np.array(img_pil.convert("L")) / 255.0
+    
+    # 1. 全域二值化
+    binary = arr < global_thresh
+    
+    # 2. 覆蓋局部區域
+    for r in region_list:
+        x1, y1, x2, y2 = r['coords']
+        t = r['threshold']
+        # 邊界檢查與裁切
+        x1, x2 = max(0, int(x1)), min(arr.shape[1], int(x2))
+        y1, y2 = max(0, int(y1)), min(arr.shape[0], int(y2))
+        
+        if x1 < x2 and y1 < y2:
+            # 局部二值化覆蓋
+            binary[y1:y2, x1:x2] = arr[y1:y2, x1:x2] < t
+            
+    return binary
+
 # --- Python 實作中心線演算法 (取代 Autotrace) ---
 
 def preprocess_image(img):
@@ -163,20 +192,15 @@ def preprocess_image(img):
     # img = img.filter(ImageFilter.SHARPEN)
     return img
 
-def get_centerline_paths(input_path, threshold, turdsize):
+def get_centerline_paths(input_path, threshold, turdsize, region_list):
     # 1. 讀取圖片並二值化
     with Image.open(input_path) as img:
         # 前處理：清晰化圖片
         img = preprocess_image(img)
-        gray = img.convert("L")
-        # 轉為 0.0-1.0 浮點數，以便進行高斯模糊
-        arr = np.array(gray) / 255.0
+        # 使用混合二值化邏輯
+        binary = generate_binary_mask(img, float(threshold), region_list)
     
-    # 閾值處理：直接使用清晰化後的影像進行二值化
-    # 移除高斯模糊，以符合「先最清晰化後找到中心線」的邏輯，確保像素級精確度
-    binary = arr < float(threshold)
-    
-    # 優化：微幅膨脹以連接斷裂的線條 (Gap Closing)
+    # 優化：微幅膨脹以連接斷裂的線條 (Gap Closing) - 暫時關閉
     # 這能確保「原本的連續線條無斷裂」，避免因閾值導致的 1 像素斷點
     # binary = binary_dilation(binary, disk(1))
     
@@ -441,7 +465,7 @@ def on_conversion_error(error_msg, btn, label, progress):
     except Exception:
         pass
 
-def run_conversion(input_path, output_path, threshold, turdsize, is_centerline, btn_widget, lbl_widget, progress_bar):
+def run_conversion(input_path, output_path, threshold, turdsize, is_centerline, region_list, btn_widget, lbl_widget, progress_bar):
     try:
         # 稍作延遲，讓介面有時間完成更新，避免瞬間卡死
         time.sleep(0.1)
@@ -453,7 +477,7 @@ def run_conversion(input_path, output_path, threshold, turdsize, is_centerline, 
         try:
             if is_centerline:
                 # 中心線模式：計算路徑
-                paths, w, h = get_centerline_paths(input_path, threshold, turdsize)
+                paths, w, h = get_centerline_paths(input_path, threshold, turdsize, region_list)
                 
                 # 依據副檔名決定存檔格式
                 if output_path.lower().endswith(".dxf"):
@@ -464,7 +488,17 @@ def run_conversion(input_path, output_path, threshold, turdsize, is_centerline, 
                 # 一般模式 (Potrace)
                 with Image.open(input_path) as img:
                     img = preprocess_image(img)
-                    img.convert("L").save(temp_bmp)
+                    # 產生混合後的二值圖
+                    binary = generate_binary_mask(img, threshold, region_list)
+                    # 轉回 uint8 圖片 (0=Black, 255=White) 供 Potrace 使用
+                    # Potrace: 黑色是前景。我們的 binary True(1) 是線條(黑)。
+                    # Image.fromarray: True->1, False->0. 
+                    # 我們需要: 線條(True) -> 黑色(0)? 不，Potrace 讀取 BMP 時，通常深色是前景。
+                    # 讓我們先轉成標準灰階： True(線條) -> 0(黑), False(背景) -> 255(白)
+                    # binary 是 boolean，True 代表"是線條"。
+                    # np.where(binary, 0, 255)
+                    img_out = Image.fromarray(np.where(binary, 0, 255).astype(np.uint8))
+                    img_out.save(temp_bmp)
                 
                 # 判斷輸出格式
                 backend = "svg"
@@ -473,7 +507,7 @@ def run_conversion(input_path, output_path, threshold, turdsize, is_centerline, 
                 
                 cmd = [
                     potrace_path, "-b", backend, "-o", output_path,
-                    "-t", str(turdsize), "-k", str(threshold), temp_bmp
+                    "-t", str(turdsize), "-k", "0.5", temp_bmp # 這裡 -k 設為 0.5，因為我們已經手動二值化了
                 ]
                 # Potrace 的 SVG 模式需要 -s 參數，DXF 不需要
                 if backend == "svg":
@@ -538,9 +572,9 @@ def convert_jpg_to_svg():
         return
 
     # 取得使用者輸入的參數
-    thresh = 0.65
+    thresh = scale_global_thresh.get()
     # 提高預設雜點過濾值，以利骨架修剪演算法去除交叉點的三角形雜訊與毛邊
-    t_size = 0
+    t_size = int(entry_turd.get()) if entry_turd.get() else 0
     is_centerline = centerline_var.get()
 
     # 更新介面狀態並啟動轉換執行緒
@@ -554,12 +588,14 @@ def convert_jpg_to_svg():
     root.update()       # 強制立即更新介面
     
     # 使用執行緒執行轉換，避免介面卡死
-    threading.Thread(target=run_conversion, args=(input_path, output_path, thresh, t_size, is_centerline, btn, label, progress)).start()
+    # 傳入 regions 副本以防轉換過程中被修改
+    regions_copy = list(regions)
+    threading.Thread(target=run_conversion, args=(input_path, output_path, thresh, t_size, is_centerline, regions_copy, btn, label, progress)).start()
 
 # --- 新增圖片載入與預覽功能 ---
 
 def load_image():
-    global current_input_path, zoom_level, current_image, current_processed_image
+    global current_input_path, zoom_level, current_image, current_processed_image, regions, selected_region_index
     path = filedialog.askopenfilename(
         title="選擇要轉換的圖片",
         filetypes=[("Image files", "*.jpg;*.jpeg;*.png;*.bmp;*.webp"), ("All files", "*.*")]
@@ -571,6 +607,10 @@ def load_image():
         current_processed_image = preprocess_image(current_image)
         zoom_level = 1.0
         lbl_file_info.config(text=f"目前檔案: {os.path.basename(path)}")
+        regions = [] # 清空舊的區域
+        selected_region_index = None
+        update_region_list_ui()
+        update_delete_button_state()
         update_preview()
         btn.config(text="開始轉換 SVG", state=tk.NORMAL)
 
@@ -592,17 +632,176 @@ def on_mouse_wheel(event):
     zoom_level = max(0.1, min(zoom_level, 10.0))
     update_preview()
 
+# --- 互動式區域選擇邏輯 ---
+
+regions = [] # 格式: {'coords': (x1, y1, x2, y2), 'threshold': 0.65, 'rect_id': canvas_id}
+selected_region_index = None # 目前選取的區域索引
+is_selection_mode = False
+drag_start = None
+temp_rect_id = None
+current_ratio = 1.0 # 縮放比例，用於座標換算
+
+def toggle_selection_mode():
+    global is_selection_mode
+    is_selection_mode = not is_selection_mode
+    if is_selection_mode:
+        btn_select_mode.config(text="結束框選模式", bg="#ffcccc", relief=tk.SUNKEN)
+        canvas_original.config(cursor="crosshair")
+        label.config(text="【框選模式】請在左側原圖上拖曳滑鼠框選區域", fg="red")
+    else:
+        btn_select_mode.config(text="新增局部調整區域", bg="SystemButtonFace", relief=tk.RAISED)
+        canvas_original.config(cursor="")
+        label.config(text="調整參數後，按 Enter 可更新預覽", fg="blue")
+
+def clear_regions():
+    global regions, selected_region_index
+    for r in regions:
+        canvas_original.delete(r['rect_id'])
+    regions = []
+    selected_region_index = None
+    update_region_list_ui()
+    update_preview()
+    update_delete_button_state()
+
+def undo_last_region():
+    global selected_region_index
+    if regions:
+        r = regions.pop()
+        canvas_original.delete(r['rect_id'])
+        selected_region_index = None # 清除選取狀態避免索引錯誤
+        update_region_list_ui()
+        update_preview()
+        update_delete_button_state()
+
+def delete_selected_region():
+    global regions, selected_region_index
+    if selected_region_index is not None and 0 <= selected_region_index < len(regions):
+        canvas_original.delete(regions[selected_region_index]['rect_id'])
+        regions.pop(selected_region_index)
+        selected_region_index = None
+        update_region_list_ui()
+        update_preview()
+        update_delete_button_state()
+
+def update_delete_button_state():
+    if selected_region_index is not None:
+        btn_delete_selected.config(state=tk.NORMAL, text="刪除選取區域")
+    else:
+        btn_delete_selected.config(state=tk.DISABLED, text="刪除選取區域")
+
+def update_region_list_ui():
+    lbl_region_count.config(text=f"已設定 {len(regions)} 個局部區域")
+
+# 新增：更新局部閾值的回呼函式
+def update_local_thresh(val):
+    global selected_region_index
+    # 如果有選取區域，更新最後一個區域的閾值並刷新預覽
+    if selected_region_index is not None and selected_region_index < len(regions):
+        regions[selected_region_index]['threshold'] = float(val)
+        update_preview()
+    elif regions and selected_region_index is None:
+        # 若無選取，預設不動作，或可選擇更新最後一個 (視需求而定，這裡保持不動作以免誤觸)
+        pass
+
 def on_mouse_down(event):
-    event.widget.scan_mark(event.x, event.y)
+    global drag_start, temp_rect_id, selected_region_index
+    
+    # 取得 Canvas 座標
+    cx = event.widget.canvasx(event.x)
+    cy = event.widget.canvasy(event.y)
+
+    if is_selection_mode and current_input_path:
+        drag_start = (cx, cy)
+        # 建立暫時矩形
+        temp_rect_id = event.widget.create_rectangle(cx, cy, cx, cy, outline="red", width=2, dash=(4, 4))
+    else:
+        # 檢查是否點擊到現有區域 (反向遍歷，優先選取最上層)
+        clicked_region = None
+        if regions:
+            for i in range(len(regions) - 1, -1, -1):
+                r = regions[i]
+                # 將圖片座標轉換為目前的 Canvas 座標
+                rx1, ry1, rx2, ry2 = r['coords']
+                x1 = rx1 * current_ratio
+                y1 = ry1 * current_ratio
+                x2 = rx2 * current_ratio
+                y2 = ry2 * current_ratio
+                
+                # 簡單的碰撞偵測
+                if x1 <= cx <= x2 and y1 <= cy <= y2:
+                    clicked_region = i
+                    break
+        
+        if clicked_region is not None:
+            selected_region_index = clicked_region
+            # 更新滑桿數值以顯示該區域設定 (這會觸發 update_local_thresh，但數值一致所以無害)
+            scale_local_thresh.set(regions[selected_region_index]['threshold'])
+            update_preview()
+            update_delete_button_state()
+        else:
+            # 點擊空白處，取消選取
+            if selected_region_index is not None:
+                selected_region_index = None
+                update_preview()
+                update_delete_button_state()
+            
+            # 原有的平移功能
+            event.widget.scan_mark(event.x, event.y)
 
 def on_mouse_drag(event):
-    event.widget.scan_dragto(event.x, event.y, gain=1)
+    if is_selection_mode and drag_start:
+        cx = event.widget.canvasx(event.x)
+        cy = event.widget.canvasy(event.y)
+        event.widget.coords(temp_rect_id, drag_start[0], drag_start[1], cx, cy)
+    else:
+        event.widget.scan_dragto(event.x, event.y, gain=1)
+
+def on_mouse_up(event):
+    global drag_start, temp_rect_id, regions, selected_region_index
+    if is_selection_mode and drag_start:
+        cx = event.widget.canvasx(event.x)
+        cy = event.widget.canvasy(event.y)
+        
+        # 計算實際圖片座標
+        # Canvas 座標 = 圖片座標 * zoom_level * ratio
+        # 所以 圖片座標 = Canvas 座標 / (zoom_level * ratio)
+        # 但注意 update_preview 中計算的 ratio 是基於 base_size 的
+        scale = current_ratio # 這是 (new_w / w)
+        
+        x1, y1 = drag_start
+        x2, y2 = cx, cy
+        
+        # 轉換回原始圖片像素座標
+        ix1, iy1 = x1 / scale, y1 / scale
+        ix2, iy2 = x2 / scale, y2 / scale
+        
+        # 確保座標正確 (左上到右下)
+        rx1, rx2 = min(ix1, ix2), max(ix1, ix2)
+        ry1, ry2 = min(iy1, iy2), max(iy1, iy2)
+        
+        # 只有當區域夠大時才新增
+        if (rx2 - rx1) > 5 and (ry2 - ry1) > 5:
+            # 使用目前的「局部閾值」滑桿數值
+            thresh = scale_local_thresh.get()
+            regions.append({'coords': (rx1, ry1, rx2, ry2), 'threshold': thresh, 'rect_id': temp_rect_id})
+            selected_region_index = len(regions) - 1 # 自動選取剛建立的區域
+            # 將虛線改為實線表示已確認
+            event.widget.itemconfig(temp_rect_id, dash=(), outline="#ff0000", width=2)
+            update_region_list_ui()
+            update_preview()
+            update_delete_button_state()
+        else:
+            event.widget.delete(temp_rect_id)
+        
+        drag_start = None
+        temp_rect_id = None
 
 def update_preview(*args):
+    global current_ratio
     if not current_input_path: return
     try:
         # 取得目前的閾值參數
-        thresh = 0.65
+        global_thresh = scale_global_thresh.get()
             
         # 載入圖片並調整大小以適應預覽框
         img = current_image
@@ -613,6 +812,7 @@ def update_preview(*args):
         ratio = min(base_size/w, base_size/h)
         new_w = int(w * ratio * zoom_level)
         new_h = int(h * ratio * zoom_level)
+        current_ratio = new_w / w # 更新全域比例供座標換算使用
         
         # 確保至少 1x1
         new_w = max(1, new_w)
@@ -626,12 +826,26 @@ def update_preview(*args):
         canvas_original.create_image(0, 0, image=img_tk_original, anchor=tk.NW)
         canvas_original.config(scrollregion=(0, 0, new_w, new_h))
         
-        # 2. 顯示預覽圖片 (右側) - 模擬 Potrace 的閾值處理
-        # Potrace 邏輯: 亮度 < 閾值 則為黑色(0)，否則為白色(255)
-        # 修正：使用已前處理(清晰化)的圖片進行預覽
-        gray = current_processed_image.convert("L")
-        limit = thresh * 255
-        bw = gray.point(lambda x: 0 if x < limit else 255, '1')
+        # 重繪所有區域框 (因為縮放可能改變了)
+        for i, r in enumerate(regions):
+            # 刪除舊框 (如果存在) - 其實 Canvas 清除 all 時已經刪了
+            # 這裡我們不依賴舊 ID，而是重畫。但為了效能，我們應該只在 zoom 改變時重畫。
+            # 簡單起見：每次 update_preview 都重畫框框
+            rx1, ry1, rx2, ry2 = r['coords']
+            cx1, cy1 = rx1 * current_ratio, ry1 * current_ratio
+            cx2, cy2 = rx2 * current_ratio, ry2 * current_ratio
+            
+            # 根據選取狀態決定顏色與粗細
+            color = "blue" if i == selected_region_index else "red"
+            width = 3 if i == selected_region_index else 2
+            
+            # 畫在左側原圖上
+            r['rect_id'] = canvas_original.create_rectangle(cx1, cy1, cx2, cy2, outline=color, width=width)
+
+        # 2. 顯示預覽圖片 (右側) - 使用混合二值化邏輯
+        binary_mask = generate_binary_mask(current_processed_image, global_thresh, regions)
+        # 將 True/False 轉為 0/255 (True是線條=黑=0)
+        bw = Image.fromarray(np.where(binary_mask, 0, 255).astype(np.uint8))
         
         # 縮放二值圖用於預覽 (轉回 L 模式以獲得較好的縮放視覺效果)
         bw_resized = bw.convert("L").resize((new_w, new_h), Image.Resampling.LANCZOS)
@@ -658,12 +872,50 @@ lbl_file_info = tk.Label(top_frame, text="尚未載入圖片", fg="gray")
 lbl_file_info.pack(side=tk.LEFT, padx=10)
 
 # 參數設定區塊
-settings_frame = tk.Frame(top_frame)
-settings_frame.pack(side=tk.RIGHT)
+settings_frame = tk.LabelFrame(top_frame, text="參數設定")
+settings_frame.pack(side=tk.RIGHT, padx=5)
+
+# 全域閾值
+tk.Label(settings_frame, text="全域閾值:").grid(row=0, column=0, padx=5, sticky="e")
+scale_global_thresh = tk.Scale(settings_frame, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL, length=150, command=update_preview)
+scale_global_thresh.set(0.65)
+scale_global_thresh.grid(row=0, column=1, padx=5)
+
+# 雜點過濾
+tk.Label(settings_frame, text="雜點過濾(px):").grid(row=1, column=0, padx=5, sticky="e")
+entry_turd = tk.Entry(settings_frame, width=5)
+entry_turd.insert(0, "2")
+entry_turd.grid(row=1, column=1, sticky="w", padx=5)
+entry_turd.bind('<Return>', update_preview)
 
 centerline_var = tk.BooleanVar()
 chk_centerline = tk.Checkbutton(settings_frame, text="提取中心單線 (Python 內建)", variable=centerline_var)
-chk_centerline.grid(row=0, column=0, columnspan=3, pady=5, sticky="w")
+chk_centerline.grid(row=2, column=0, columnspan=2, pady=2, sticky="w")
+
+# --- 新增：局部調整控制區 ---
+roi_frame = tk.LabelFrame(root, text="局部區域調整 (ROI)", fg="blue")
+roi_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=5)
+
+btn_select_mode = tk.Button(roi_frame, text="新增局部調整區域", command=toggle_selection_mode)
+btn_select_mode.pack(side=tk.LEFT, padx=10, pady=5)
+
+tk.Label(roi_frame, text="局部閾值:").pack(side=tk.LEFT, padx=5)
+scale_local_thresh = tk.Scale(roi_frame, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL, length=150, command=update_local_thresh)
+scale_local_thresh.set(0.45) # 預設比全域低一點，適合去除雜點
+scale_local_thresh.pack(side=tk.LEFT, padx=5)
+tk.Label(roi_frame, text="(框選時套用此值)").pack(side=tk.LEFT)
+
+btn_undo = tk.Button(roi_frame, text="復原上一個", command=undo_last_region)
+btn_undo.pack(side=tk.LEFT, padx=10)
+
+btn_delete_selected = tk.Button(roi_frame, text="刪除選取區域", command=delete_selected_region, state=tk.DISABLED)
+btn_delete_selected.pack(side=tk.LEFT, padx=5)
+
+btn_clear = tk.Button(roi_frame, text="清除所有區域", command=clear_regions)
+btn_clear.pack(side=tk.LEFT, padx=5)
+
+lbl_region_count = tk.Label(roi_frame, text="已設定 0 個局部區域", fg="gray")
+lbl_region_count.pack(side=tk.RIGHT, padx=10)
 
 # 中間預覽區 (畫布)
 preview_frame = tk.Frame(root)
@@ -689,6 +941,7 @@ canvas_original.bind("<Button-4>", on_mouse_wheel)
 canvas_original.bind("<Button-5>", on_mouse_wheel)
 canvas_original.bind("<ButtonPress-1>", on_mouse_down)
 canvas_original.bind("<B1-Motion>", on_mouse_drag)
+canvas_original.bind("<ButtonRelease-1>", on_mouse_up) # 新增放開事件
 
 # 右側：預覽
 frame_right = tk.LabelFrame(preview_frame, text="轉換預覽 (黑白閾值效果)")
