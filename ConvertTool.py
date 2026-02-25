@@ -21,22 +21,24 @@ root.geometry("850x600")
 try:
     from PIL import Image, ImageTk, ImageEnhance, ImageFilter
     import numpy as np
-    from skimage.morphology import skeletonize, remove_small_objects, binary_dilation, disk
+    from skimage.morphology import skeletonize, remove_small_objects, binary_dilation, disk, remove_small_holes
     from rdp import rdp
+    import ezdxf
 except ImportError:
     root.withdraw()
-    if messagebox.askyesno("缺少套件", "本程式需要 Pillow, scikit-image, numpy, rdp 套件來執行中心線運算。\n\n是否立即安裝？"):
+    if messagebox.askyesno("缺少套件", "本程式需要 Pillow, scikit-image, numpy, rdp, ezdxf 套件來執行運算。\n\n是否立即安裝？"):
         try:
             root.deiconify()
             root.title("正在安裝必要套件 (可能需要幾分鐘)...")
             root.update()
             # 安裝所有依賴
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "Pillow", "scikit-image", "numpy", "rdp"])
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "Pillow", "scikit-image", "numpy", "rdp", "ezdxf"])
             
             from PIL import Image, ImageTk, ImageEnhance, ImageFilter
             import numpy as np
-            from skimage.morphology import skeletonize, remove_small_objects, binary_dilation, disk
+            from skimage.morphology import skeletonize, remove_small_objects, binary_dilation, disk, remove_small_holes
             from rdp import rdp
+            import ezdxf
             
             messagebox.showinfo("成功", "套件安裝完成！")
         except Exception as e:
@@ -151,17 +153,17 @@ def preprocess_image(img):
         img = img.convert('RGB')
     
     # 0. 初步降噪 (平滑化)，避免後續銳化步驟放大原始噪點
-    img = img.filter(ImageFilter.SMOOTH)
+    # img = img.filter(ImageFilter.SMOOTH) # 移除平滑化以保留更多細節
     
     # 1. 增強對比度 (1.5倍)
     enhancer = ImageEnhance.Contrast(img)
-    img = enhancer.enhance(1.5)
+    img = enhancer.enhance(1.0)
     
     # 2. 銳化濾鏡
-    img = img.filter(ImageFilter.SHARPEN)
+    # img = img.filter(ImageFilter.SHARPEN)
     return img
 
-def process_centerline_svg(input_path, output_path, threshold, turdsize):
+def get_centerline_paths(input_path, threshold, turdsize):
     # 1. 讀取圖片並二值化
     with Image.open(input_path) as img:
         # 前處理：清晰化圖片
@@ -176,11 +178,14 @@ def process_centerline_svg(input_path, output_path, threshold, turdsize):
     
     # 優化：微幅膨脹以連接斷裂的線條 (Gap Closing)
     # 這能確保「原本的連續線條無斷裂」，避免因閾值導致的 1 像素斷點
-    binary = binary_dilation(binary, disk(1))
+    # binary = binary_dilation(binary, disk(1))
     
+    # 填補微小孔洞，避免骨架化時產生封閉迴圈 (三角形/圓形雜訊)
+    # binary = remove_small_holes(binary, area_threshold=5)
+
     # 自動去掉只有一格像素且周圍完全不相連的像素點
     # connectivity=2 (8-鄰域) 確保保留對角線連接的像素，但移除真正的孤立點
-    binary = remove_small_objects(binary, min_size=2, connectivity=2)
+    binary = remove_small_objects(binary, min_size=1, connectivity=2)
     
     # 2. 移除雜點
     if turdsize > 0:
@@ -254,9 +259,7 @@ def process_centerline_svg(input_path, output_path, threshold, turdsize):
     points = list(zip(ys, xs))
     
     if not points:
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write('<svg></svg>')
-        return
+        return [], skeleton.shape[1], skeleton.shape[0]
 
     # 建立鄰接表 (Adjacency List)
     point_set = set(points)
@@ -359,11 +362,43 @@ def process_centerline_svg(input_path, output_path, threshold, turdsize):
         loop_path.append(start) # 閉合
         paths.append(loop_path)
 
-    # 5. 寫入 SVG
+    # 回傳路徑列表與圖片尺寸 (寬, 高)
     h, w = skeleton.shape
+    return paths, w, h
+
+def save_as_dxf(paths, width, height, output_path):
+    """將路徑儲存為 DXF 檔案 (AutoCAD R2010 格式)"""
+    try:
+        doc = ezdxf.new('R2010')
+        # 設定單位為毫米 (Millimeters)
+        doc.header['$INSUNITS'] = 4 
+        
+        # 建立 CENTER 圖層，設定顏色為紅色 (AutoCAD Color Index 1)
+        doc.layers.new(name='CENTER', dxfattribs={'color': 1})
+        
+        msp = doc.modelspace()
+        
+        for path in paths:
+            # 座標轉換：
+            # 1. (y, x) -> (x, y)
+            # 2. 翻轉 Y 軸：CAD 原點在左下，圖片在左上。為了讓圖形正立，需用 height - y
+            dxf_points = [(p[1], height - p[0]) for p in path]
+            
+            # 使用 RDP 簡化
+            simplified_path = rdp(dxf_points, epsilon=0.1)
+            
+            # 加入輕量聚合線 (LWPolyline) 到 CENTER 圖層
+            msp.add_lwpolyline(simplified_path, dxfattribs={'layer': 'CENTER'})
+            
+        doc.saveas(output_path)
+    except Exception as e:
+        raise RuntimeError(f"DXF 儲存失敗: {e}")
+
+def save_as_svg(paths, width, height, output_path):
+    """將路徑儲存為 SVG 檔案"""
     with open(output_path, "w", encoding="utf-8") as f:
-        f.write(f'<svg width="{w}" height="{h}" xmlns="http://www.w3.org/2000/svg">\n')
-        f.write(f'<g fill="none" stroke="black" stroke-width="1">\n')
+        f.write(f'<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg">\n')
+        f.write(f'<g fill="none" stroke="black" stroke-width="0.5">\n')
         
         for path in paths:
             # 座標轉換 (y, x) -> (x, y)
@@ -372,7 +407,7 @@ def process_centerline_svg(input_path, output_path, threshold, turdsize):
             # 使用 RDP 演算法簡化線條
             # 移除 smooth_polyline 以確保「夾角做到最銳利化」
             # epsilon 設為 1.0 像素，可根據需求調整
-            simplified_path = rdp(xy_path, epsilon=1.0)
+            simplified_path = rdp(xy_path, epsilon=0.1)
             
             points_str = " ".join([f"{p[0]},{p[1]}" for p in simplified_path])
             f.write(f'<polyline points="{points_str}" />\n')
@@ -417,19 +452,33 @@ def run_conversion(input_path, output_path, threshold, turdsize, is_centerline, 
         
         try:
             if is_centerline:
-                # 中心線模式：使用 Python 內建演算法 (scikit-image + rdp)
-                # 不再依賴 autotrace.exe
-                process_centerline_svg(input_path, output_path, threshold, turdsize)
+                # 中心線模式：計算路徑
+                paths, w, h = get_centerline_paths(input_path, threshold, turdsize)
+                
+                # 依據副檔名決定存檔格式
+                if output_path.lower().endswith(".dxf"):
+                    save_as_dxf(paths, w, h, output_path)
+                else:
+                    save_as_svg(paths, w, h, output_path)
             else:
                 # 一般模式 (Potrace)
                 with Image.open(input_path) as img:
                     img = preprocess_image(img)
                     img.convert("L").save(temp_bmp)
                 
+                # 判斷輸出格式
+                backend = "svg"
+                if output_path.lower().endswith(".dxf"):
+                    backend = "dxf"
+                
                 cmd = [
-                    potrace_path, "-s", "-o", output_path,
+                    potrace_path, "-b", backend, "-o", output_path,
                     "-t", str(turdsize), "-k", str(threshold), temp_bmp
                 ]
+                # Potrace 的 SVG 模式需要 -s 參數，DXF 不需要
+                if backend == "svg":
+                    cmd.insert(1, "-s")
+                    
                 subprocess.check_call(cmd, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
         finally:
             if os.path.exists(temp_bmp):
@@ -473,20 +522,25 @@ def convert_jpg_to_svg():
         
     input_path = current_input_path
 
-    # 詢問輸出資料夾
-    output_dir = filedialog.askdirectory(title="選擇輸出資料夾")
-    if not output_dir:
-        return
-
     # 自動產生輸出路徑 (使用原檔名，副檔名改為 .svg)
     base_name = os.path.basename(input_path)
     name_without_ext = os.path.splitext(base_name)[0]
-    output_path = os.path.join(output_dir, name_without_ext + ".svg")
+    
+    # 詢問存檔位置與格式 (支援 SVG 與 DXF)
+    output_path = filedialog.asksaveasfilename(
+        title="儲存檔案",
+        initialfile=name_without_ext,
+        defaultextension=".dxf",
+        filetypes=[("DXF 工程圖", "*.dxf"), ("SVG 向量圖", "*.svg")]
+    )
+    
+    if not output_path:
+        return
 
     # 取得使用者輸入的參數
-    thresh = 0.5
+    thresh = 0.65
     # 提高預設雜點過濾值，以利骨架修剪演算法去除交叉點的三角形雜訊與毛邊
-    t_size = 15
+    t_size = 0
     is_centerline = centerline_var.get()
 
     # 更新介面狀態並啟動轉換執行緒
@@ -548,7 +602,7 @@ def update_preview(*args):
     if not current_input_path: return
     try:
         # 取得目前的閾值參數
-        thresh = 0.5
+        thresh = 0.65
             
         # 載入圖片並調整大小以適應預覽框
         img = current_image
