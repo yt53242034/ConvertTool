@@ -1,0 +1,22 @@
+# Python 編譯與快取檔案
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虛擬環境 (Virtual Environments)
+venv/
+env/
+.env
+
+# 專案特定忽略檔案
+# 忽略自動下載的 potrace 資料夾 (這是執行檔，不應放入原始碼庫)
+potrace/
+
+# 忽略程式執行過程產生的暫存圖片
+*.ppm
+*.bmp
+
+# (選用) 忽略輸出的結果檔案，保持倉庫乾淨
+# 如果您希望上傳範例圖，可以移除下面兩行
+*.svg
+*.dxf

@@ -1,0 +1,5 @@
+Pillow
+scikit-image
+numpy
+rdp
+ezdxf
