@@ -14,14 +14,14 @@ import tempfile
 
 # 初始化主視窗 (移至最上方，統一管理)
 root = tk.Tk()
-root.title("圖片 轉 SVG 工具")
+root.title("圖片 轉 SVG 工具 beta 1.0")
 root.geometry("1000x700") # 加大視窗以容納新控制項
 
 # 檢查並安裝必要套件 (Pillow, scikit-image, numpy, rdp)
 try:
     from PIL import Image, ImageTk, ImageEnhance, ImageFilter
     import numpy as np
-    from skimage.morphology import skeletonize, remove_small_objects, binary_dilation, disk, remove_small_holes
+    from skimage.morphology import skeletonize, remove_small_objects, binary_dilation, binary_closing, binary_opening, binary_erosion, disk, remove_small_holes, thin
     from rdp import rdp
     import ezdxf
 except ImportError:
@@ -36,7 +36,7 @@ except ImportError:
             
             from PIL import Image, ImageTk, ImageEnhance, ImageFilter
             import numpy as np
-            from skimage.morphology import skeletonize, remove_small_objects, binary_dilation, disk, remove_small_holes
+            from skimage.morphology import skeletonize, remove_small_objects, binary_dilation, binary_closing, binary_opening, binary_erosion, disk, remove_small_holes, thin
             from rdp import rdp
             import ezdxf
             
@@ -146,12 +146,13 @@ if not potrace_path:
 
 # --- 核心影像處理邏輯 (新增局部閾值支援) ---
 
-def generate_binary_mask(img_pil, global_thresh, region_list):
+def generate_binary_mask(img_pil, global_thresh, region_list, scale_factor=1.0):
     """
     產生二值化遮罩，支援全域閾值與局部區域閾值混合
     img_pil: PIL Image (RGB or L)
     global_thresh: float (0.0 - 1.0)
     region_list: list of dict {'coords': (x1, y1, x2, y2), 'threshold': float}
+    scale_factor: float, 用於將區域座標映射到超取樣後的圖片尺寸
     """
     # 轉為灰階並正規化為 0.0-1.0
     arr = np.array(img_pil.convert("L")) / 255.0
@@ -163,6 +164,9 @@ def generate_binary_mask(img_pil, global_thresh, region_list):
     for r in region_list:
         x1, y1, x2, y2 = r['coords']
         t = r['threshold']
+        # 根據縮放倍率調整區域座標
+        x1, x2 = x1 * scale_factor, x2 * scale_factor
+        y1, y2 = y1 * scale_factor, y2 * scale_factor
         # 邊界檢查與裁切
         x1, x2 = max(0, int(x1)), min(arr.shape[1], int(x2))
         y1, y2 = max(0, int(y1)), min(arr.shape[0], int(y2))
@@ -175,11 +179,16 @@ def generate_binary_mask(img_pil, global_thresh, region_list):
 
 # --- Python 實作中心線演算法 (取代 Autotrace) ---
 
-def preprocess_image(img):
+def preprocess_image(img, scale_factor=1.0):
     """圖片前處理：增強對比與銳化，提升線條識別率"""
     # 確保是 RGB 模式
     if img.mode != 'RGB':
         img = img.convert('RGB')
+    
+    # 超取樣：放大圖片以提升骨架化精度
+    if scale_factor > 1.0:
+        w, h = img.size
+        img = img.resize((int(w * scale_factor), int(h * scale_factor)), Image.Resampling.LANCZOS)
     
     # 0. 初步降噪 (平滑化)，避免後續銳化步驟放大原始噪點
     # img = img.filter(ImageFilter.SMOOTH) # 移除平滑化以保留更多細節
@@ -192,17 +201,138 @@ def preprocess_image(img):
     # img = img.filter(ImageFilter.SHARPEN)
     return img
 
-def get_centerline_paths(input_path, threshold, turdsize, region_list):
+def _strength_to_radius_passes(strength):
+    """
+    將 0-4 的強度轉成形態學操作的半徑與次數，避免效果跳太大。
+    0: 不套用
+    1: 半徑1, 1次 (最弱)
+    2: 半徑1, 2次 (中弱)
+    3: 半徑2, 1次 (中強)
+    4: 半徑2, 2次 (最強)
+    """
+    s = int(max(0, min(4, strength)))
+    if s == 0:
+        return 0, 0
+    if s == 1:
+        return 1, 1
+    if s == 2:
+        return 1, 2
+    if s == 3:
+        return 2, 1
+    return 2, 2
+
+def _apply_morph(binary, op_func, radius, passes):
+    if radius <= 0 or passes <= 0:
+        return binary
+    selem = disk(radius)
+    for _ in range(passes):
+        binary = op_func(binary, selem)
+    return binary
+
+def preprocess_binary_mask(
+    binary,
+    turdsize,
+    use_closing=False,
+    use_opening=False,
+    use_erosion=False,
+    closing_strength=1,
+    opening_strength=1,
+    erosion_strength=1
+):
+    """
+    對二值化遮罩進行形態學處理，優化骨架提取效果
+    1. Thinning: 線條細化 (解決線條暈染變粗導致的偏移，使用 thin 替代 erosion 以避免斷裂)
+    2. Opening: 去除微小突起與沾黏 (解決附著線導致的骨架偏移)
+    3. Closing: 填補孔洞、連接斷線、平滑邊緣 (解決平行線附著導致的骨架偏移)
+    調整順序以避免過度侵蝕：
+    1. Closing: 先填補孔洞與平滑邊緣 (避免後續侵蝕造成斷裂)
+    2. Erosion: 線條細化
+    3. Opening: 若已執行 Erosion，則跳過 Opening (避免二次侵蝕)，改由去噪處理；否則執行 Opening 去除沾黏
+    4. Remove Small Objects: 去除雜訊
+    """
+    # 1. 線條細化 (去除粗邊)
+    # 1. 連接鄰近線條 (平滑化) - 先做，讓線條結構更完整
+    # 使用 disk(1) 進行閉運算，填補 1-2px 的縫隙並平滑邊緣
+    closing_radius, closing_passes = _strength_to_radius_passes(closing_strength)
+    opening_radius, opening_passes = _strength_to_radius_passes(opening_strength)
+    erosion_iters = int(max(1, min(4, erosion_strength)))
+
+    if use_closing and closing_passes > 0:
+        binary = _apply_morph(binary, binary_closing, closing_radius, closing_passes)
+
+    # 2. 線條細化 (去除粗邊)
+    # 改用 thin(max_iter=1) 替代 binary_erosion，這能保留線條連通性，避免細線斷裂
+    if use_erosion:
+        # 分段細化比一次重手 erosion 更穩定，較不易把細線直接弄斷。
+        for _ in range(erosion_iters):
+            binary = thin(binary, max_iter=1)
+
+    # 3. 去除沾黏 (智慧修邊)
+    # 若已執行細化，線條已變細，突起物通常已斷裂，再做 Opening 可能會過度。
+    # 但 thin 比 erosion 溫和，我們仍可嘗試執行 Opening，但需注意風險。
+    # 這裡維持邏輯：若有細化，則跳過 Opening，交由後續去噪處理。
+    # 智慧修邊預設在細化後仍允許執行，但若已啟用細化則自動降低一階，避免過度削弱。
+    if use_opening and opening_passes > 0:
+        eff_opening_passes = opening_passes
+        eff_opening_radius = opening_radius
+        if use_erosion:
+            if eff_opening_passes > 1:
+                eff_opening_passes -= 1
+            elif eff_opening_radius > 1:
+                eff_opening_radius -= 1
+        binary = _apply_morph(binary, binary_opening, eff_opening_radius, eff_opening_passes)
+
+    # 3. 連接鄰近線條 (平滑化)
+    # 使用 disk(1) 進行閉運算，填補 1-2px 的縫隙並平滑邊緣
+    if use_closing and closing_passes > 0:
+        # 第二次 closing 用較弱版本做邊界修飾，避免補洞過頭。
+        tail_passes = 1 if closing_passes >= 1 else 0
+        tail_radius = 1 if closing_radius >= 1 else 0
+        binary = _apply_morph(binary, binary_closing, tail_radius, tail_passes)
+    
+    # 移除孤立像素 (1px)
+    binary = remove_small_objects(binary, min_size=1, connectivity=2)
+    
+    # 移除指定大小以下的雜塊
+    if turdsize > 0:
+        binary = remove_small_objects(binary, min_size=int(turdsize), connectivity=2)
+        
+    return binary
+
+def get_centerline_paths(
+    input_path,
+    threshold,
+    turdsize,
+    region_list,
+    use_closing=False,
+    use_opening=False,
+    use_erosion=False,
+    scale_factor=1.0,
+    closing_strength=1,
+    opening_strength=1,
+    erosion_strength=1
+):
     # 1. 讀取圖片並二值化
     with Image.open(input_path) as img:
         # 前處理：清晰化圖片
-        img = preprocess_image(img)
+        img = preprocess_image(img, scale_factor)
         # 使用混合二值化邏輯
-        binary = generate_binary_mask(img, float(threshold), region_list)
+        binary = generate_binary_mask(img, float(threshold), region_list, scale_factor)
     
     # 優化：微幅膨脹以連接斷裂的線條 (Gap Closing) - 暫時關閉
     # 這能確保「原本的連續線條無斷裂」，避免因閾值導致的 1 像素斷點
     # binary = binary_dilation(binary, disk(1))
+    # 使用共用的前處理邏輯 (包含 Erosion, Opening, Closing 與去噪)
+    binary = preprocess_binary_mask(
+        binary,
+        turdsize,
+        use_closing,
+        use_opening,
+        use_erosion,
+        closing_strength=closing_strength,
+        opening_strength=opening_strength,
+        erosion_strength=erosion_strength
+    )
     
     # 填補微小孔洞，避免骨架化時產生封閉迴圈 (三角形/圓形雜訊)
     # binary = remove_small_holes(binary, area_threshold=5)
@@ -387,11 +517,19 @@ def get_centerline_paths(input_path, threshold, turdsize, region_list):
         paths.append(loop_path)
 
     # 回傳路徑列表與圖片尺寸 (寬, 高)
+    # 若有進行超取樣，需將座標與尺寸還原回原始比例
+    if scale_factor > 1.0:
+        downscaled_paths = []
+        for path in paths:
+            # path 點格式為 (y, x)
+            downscaled_paths.append([(p[0] / scale_factor, p[1] / scale_factor) for p in path])
+        return downscaled_paths, skeleton.shape[1] / scale_factor, skeleton.shape[0] / scale_factor
+        
     h, w = skeleton.shape
     return paths, w, h
 
 def save_as_dxf(paths, width, height, output_path):
-    """將路徑儲存為 DXF 檔案 (AutoCAD R2010 格式)"""
+    """將路徑儲存為 DXF 檔案，自動判斷直線與曲線"""
     try:
         doc = ezdxf.new('R2010')
         # 設定單位為毫米 (Millimeters)
@@ -408,18 +546,22 @@ def save_as_dxf(paths, width, height, output_path):
             # 2. 翻轉 Y 軸：CAD 原點在左下，圖片在左上。為了讓圖形正立，需用 height - y
             dxf_points = [(p[1], height - p[0]) for p in path]
             
-            # 使用 RDP 簡化
-            simplified_path = rdp(dxf_points, epsilon=0.1)
+            # 使用 RDP 簡化，固定 epsilon=2.0 過濾像素雜訊
+            simplified_path = rdp(dxf_points, epsilon=2.0)
             
-            # 加入輕量聚合線 (LWPolyline) 到 CENTER 圖層
-            msp.add_lwpolyline(simplified_path, dxfattribs={'layer': 'CENTER'})
+            if len(simplified_path) >= 3:
+                # 使用 Spline 擬合點 (Fit Points) 產生平滑曲線
+                msp.add_spline(fit_points=simplified_path, dxfattribs={'layer': 'CENTER'})
+            elif len(simplified_path) == 2:
+                # 兩點只能畫直線
+                msp.add_lwpolyline(simplified_path, dxfattribs={'layer': 'CENTER'})
             
         doc.saveas(output_path)
     except Exception as e:
         raise RuntimeError(f"DXF 儲存失敗: {e}")
 
 def save_as_svg(paths, width, height, output_path):
-    """將路徑儲存為 SVG 檔案"""
+    """將路徑儲存為 SVG 檔案，自動判斷直線與曲線"""
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(f'<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg">\n')
         f.write(f'<g fill="none" stroke="black" stroke-width="0.5">\n')
@@ -428,13 +570,32 @@ def save_as_svg(paths, width, height, output_path):
             # 座標轉換 (y, x) -> (x, y)
             xy_path = [(p[1], p[0]) for p in path]
             
-            # 使用 RDP 演算法簡化線條
-            # 移除 smooth_polyline 以確保「夾角做到最銳利化」
-            # epsilon 設為 1.0 像素，可根據需求調整
-            simplified_path = rdp(xy_path, epsilon=0.1)
+            # 使用 RDP 簡化，固定 epsilon=2.0
+            simplified_path = rdp(xy_path, epsilon=2.0)
             
-            points_str = " ".join([f"{p[0]},{p[1]}" for p in simplified_path])
-            f.write(f'<polyline points="{points_str}" />\n')
+            if len(simplified_path) < 2:
+                continue
+                
+            # 產生 SVG Path Data (使用 Catmull-Rom to Cubic Bezier 演算法)
+            points = simplified_path
+            d_parts = [f"M {points[0][0]},{points[0][1]}"]
+            
+            for i in range(len(points) - 1):
+                p0 = points[max(0, i - 1)]
+                p1 = points[i]
+                p2 = points[i + 1]
+                p3 = points[min(len(points) - 1, i + 2)]
+
+                # 計算控制點 (Catmull-Rom 樣條公式)
+                cp1x = p1[0] + (p2[0] - p0[0]) / 6.0
+                cp1y = p1[1] + (p2[1] - p0[1]) / 6.0
+                
+                cp2x = p2[0] - (p3[0] - p1[0]) / 6.0
+                cp2y = p2[1] - (p3[1] - p1[1]) / 6.0
+                
+                d_parts.append(f"C {cp1x:.2f},{cp1y:.2f} {cp2x:.2f},{cp2y:.2f} {p2[0]},{p2[1]}")
+            
+            f.write(f'<path d="{" ".join(d_parts)}" />\n')
             
         f.write('</g>\n</svg>')
 
@@ -450,6 +611,12 @@ def on_conversion_success(output_path, btn, label, progress):
         btn.config(state=tk.NORMAL, text="選擇圖片並轉換")
         label.config(text="點擊下方按鈕開始轉換")
         messagebox.showinfo("成功", f"轉換完成！已儲存至：\n{output_path}")
+        
+        # 自動開啟輸出資料夾
+        try:
+            os.startfile(os.path.dirname(output_path))
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -465,7 +632,24 @@ def on_conversion_error(error_msg, btn, label, progress):
     except Exception:
         pass
 
-def run_conversion(input_path, output_path, threshold, turdsize, is_centerline, region_list, btn_widget, lbl_widget, progress_bar):
+def run_conversion(
+    input_path,
+    output_path,
+    threshold,
+    turdsize,
+    is_centerline,
+    region_list,
+    use_closing,
+    use_opening,
+    use_erosion,
+    scale_factor,
+    closing_strength,
+    opening_strength,
+    erosion_strength,
+    btn_widget,
+    lbl_widget,
+    progress_bar
+):
     try:
         # 稍作延遲，讓介面有時間完成更新，避免瞬間卡死
         time.sleep(0.1)
@@ -477,7 +661,19 @@ def run_conversion(input_path, output_path, threshold, turdsize, is_centerline, 
         try:
             if is_centerline:
                 # 中心線模式：計算路徑
-                paths, w, h = get_centerline_paths(input_path, threshold, turdsize, region_list)
+                paths, w, h = get_centerline_paths(
+                    input_path,
+                    threshold,
+                    turdsize,
+                    region_list,
+                    use_closing,
+                    use_opening,
+                    use_erosion,
+                    scale_factor,
+                    closing_strength=closing_strength,
+                    opening_strength=opening_strength,
+                    erosion_strength=erosion_strength
+                )
                 
                 # 依據副檔名決定存檔格式
                 if output_path.lower().endswith(".dxf"):
@@ -490,6 +686,19 @@ def run_conversion(input_path, output_path, threshold, turdsize, is_centerline, 
                     img = preprocess_image(img)
                     # 產生混合後的二值圖
                     binary = generate_binary_mask(img, threshold, region_list)
+                    
+                    # 加入形態學前處理 (細化、修邊、平滑化)
+                    binary = preprocess_binary_mask(
+                        binary,
+                        turdsize,
+                        use_closing,
+                        use_opening,
+                        use_erosion,
+                        closing_strength=closing_strength,
+                        opening_strength=opening_strength,
+                        erosion_strength=erosion_strength
+                    )
+                    
                     # 轉回 uint8 圖片 (0=Black, 255=White) 供 Potrace 使用
                     # Potrace: 黑色是前景。我們的 binary True(1) 是線條(黑)。
                     # Image.fromarray: True->1, False->0. 
@@ -576,6 +785,17 @@ def convert_jpg_to_svg():
     # 提高預設雜點過濾值，以利骨架修剪演算法去除交叉點的三角形雜訊與毛邊
     t_size = int(entry_turd.get()) if entry_turd.get() else 0
     is_centerline = centerline_var.get()
+    use_closing = gap_closing_var.get()
+    use_opening = smart_clean_var.get()
+    use_erosion = erosion_var.get()
+    closing_strength = int(scale_gap_strength.get())
+    opening_strength = int(scale_opening_strength.get())
+    erosion_strength = int(scale_erosion_strength.get())
+    
+    # 取得超取樣倍率
+    scale_map = {"1x (標準)": 1.0, "2x (高品質)": 2.0, "3x (精細)": 3.0, "4x (極致)": 4.0}
+    scale_str = combo_scale.get()
+    scale_factor = scale_map.get(scale_str, 1.0)
 
     # 更新介面狀態並啟動轉換執行緒
     btn.config(state=tk.DISABLED, text="轉換中...")
@@ -590,7 +810,15 @@ def convert_jpg_to_svg():
     # 使用執行緒執行轉換，避免介面卡死
     # 傳入 regions 副本以防轉換過程中被修改
     regions_copy = list(regions)
-    threading.Thread(target=run_conversion, args=(input_path, output_path, thresh, t_size, is_centerline, regions_copy, btn, label, progress)).start()
+    threading.Thread(
+        target=run_conversion,
+        args=(
+            input_path, output_path, thresh, t_size, is_centerline, regions_copy,
+            use_closing, use_opening, use_erosion, scale_factor,
+            closing_strength, opening_strength, erosion_strength,
+            btn, label, progress
+        )
+    ).start()
 
 # --- 新增圖片載入與預覽功能 ---
 
@@ -616,21 +844,61 @@ def load_image():
 
 def on_mouse_wheel(event):
     global zoom_level
-    # Windows delta is usually 120. Linux uses buttons 4 and 5.
+    
+    if not current_input_path:
+        return
+
+    # 1. 記錄縮放前的狀態與滑鼠位置
+    old_zoom = zoom_level
+    widget = event.widget
+    
+    # 取得滑鼠在 Canvas 內容中的絕對座標 (考慮目前的捲動位置)
+    old_canvas_x = widget.canvasx(event.x)
+    old_canvas_y = widget.canvasy(event.y)
+
+    # 2. 計算新的縮放比例
+    scale_factor = 1.0
     if hasattr(event, 'delta') and event.delta != 0:
         if event.delta > 0:
-            zoom_level *= 1.1
+            scale_factor = 1.1
         else:
-            zoom_level *= 0.9
+            scale_factor = 0.9
     elif hasattr(event, 'num'):
         if event.num == 4:
-            zoom_level *= 1.1
+            scale_factor = 1.1
         elif event.num == 5:
-            zoom_level *= 0.9
+            scale_factor = 0.9
             
+    new_zoom = old_zoom * scale_factor
     # Limit zoom
-    zoom_level = max(0.1, min(zoom_level, 10.0))
+    new_zoom = max(0.1, min(new_zoom, 10.0))
+    
+    if new_zoom == old_zoom:
+        return
+        
+    zoom_level = new_zoom
     update_preview()
+    
+    # 3. 計算新的捲動位置以維持滑鼠指向同一點
+    actual_scale = new_zoom / old_zoom
+    new_canvas_x = old_canvas_x * actual_scale
+    new_canvas_y = old_canvas_y * actual_scale
+    
+    target_scroll_x = new_canvas_x - event.x
+    target_scroll_y = new_canvas_y - event.y
+    
+    # 同步更新兩個 Canvas 的捲動位置
+    for canvas in [canvas_original, canvas_preview]:
+        try:
+            sr = canvas.cget("scrollregion")
+            if sr:
+                x1, y1, x2, y2 = map(float, sr.split())
+                width = x2 - x1
+                height = y2 - y1
+                if width > 0: canvas.xview_moveto(target_scroll_x / width)
+                if height > 0: canvas.yview_moveto(target_scroll_y / height)
+        except Exception:
+            pass
 
 # --- 互動式區域選擇邏輯 ---
 
@@ -662,16 +930,6 @@ def clear_regions():
     update_region_list_ui()
     update_preview()
     update_delete_button_state()
-
-def undo_last_region():
-    global selected_region_index
-    if regions:
-        r = regions.pop()
-        canvas_original.delete(r['rect_id'])
-        selected_region_index = None # 清除選取狀態避免索引錯誤
-        update_region_list_ui()
-        update_preview()
-        update_delete_button_state()
 
 def delete_selected_region():
     global regions, selected_region_index
@@ -710,7 +968,7 @@ def on_mouse_down(event):
     cx = event.widget.canvasx(event.x)
     cy = event.widget.canvasy(event.y)
 
-    if is_selection_mode and current_input_path:
+    if is_selection_mode and current_input_path and event.widget == canvas_original:
         drag_start = (cx, cy)
         # 建立暫時矩形
         temp_rect_id = event.widget.create_rectangle(cx, cy, cx, cy, outline="red", width=2, dash=(4, 4))
@@ -844,8 +1102,36 @@ def update_preview(*args):
 
         # 2. 顯示預覽圖片 (右側) - 使用混合二值化邏輯
         binary_mask = generate_binary_mask(current_processed_image, global_thresh, regions)
-        # 將 True/False 轉為 0/255 (True是線條=黑=0)
-        bw = Image.fromarray(np.where(binary_mask, 0, 255).astype(np.uint8))
+        
+        # 取得雜點過濾值
+        try:
+            t_size = int(entry_turd.get()) if entry_turd.get() else 0
+        except:
+            t_size = 0
+        
+        # 1. 前處理 (Erosion + Opening + Closing + 去噪)
+        # 將此步驟移出 centerline_var 的判斷，讓使用者在一般模式下也能預覽修圖效果
+        binary_mask = preprocess_binary_mask(
+            binary_mask,
+            t_size,
+            use_closing=gap_closing_var.get(),
+            use_opening=smart_clean_var.get(),
+            use_erosion=erosion_var.get(),
+            closing_strength=int(scale_gap_strength.get()),
+            opening_strength=int(scale_opening_strength.get()),
+            erosion_strength=int(scale_erosion_strength.get())
+        )
+        
+        if centerline_var.get():
+            # 若開啟單線模式，在預覽中執行骨架化 (簡化版，不含耗時的 Pruning)
+            # 2. 骨架化
+            skeleton = skeletonize(binary_mask)
+            
+            # 3. 轉為顯示用圖片 (True=線條=黑=0, False=背景=白=255)
+            bw = Image.fromarray(np.where(skeleton, 0, 255).astype(np.uint8))
+        else:
+            # 一般模式：將 True/False 轉為 0/255 (True是線條=黑=0)
+            bw = Image.fromarray(np.where(binary_mask, 0, 255).astype(np.uint8))
         
         # 縮放二值圖用於預覽 (轉回 L 模式以獲得較好的縮放視覺效果)
         bw_resized = bw.convert("L").resize((new_w, new_h), Image.Resampling.LANCZOS)
@@ -860,6 +1146,28 @@ def update_preview(*args):
         print(f"Preview error: {e}")
 
 # --- GUI 介面佈局調整 ---
+
+# 輔助函式：讓滑桿支援方向鍵微調
+def bind_scale_keys(scale_widget, callback):
+    def on_key(event):
+        val = scale_widget.get()
+        res = float(scale_widget.cget("resolution"))
+        if event.keysym == "Right":
+            new_val = val + res
+        elif event.keysym == "Left":
+            new_val = val - res
+        else:
+            return
+        
+        from_ = float(scale_widget.cget("from"))
+        to_ = float(scale_widget.cget("to"))
+        new_val = max(from_, min(new_val, to_))
+        scale_widget.set(new_val)
+        callback(new_val)
+
+    scale_widget.bind("<Button-1>", lambda e: scale_widget.focus_set())
+    scale_widget.bind("<Left>", on_key)
+    scale_widget.bind("<Right>", on_key)
 
 # 頂部控制區
 top_frame = tk.Frame(root)
@@ -880,6 +1188,7 @@ tk.Label(settings_frame, text="全域閾值:").grid(row=0, column=0, padx=5, sti
 scale_global_thresh = tk.Scale(settings_frame, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL, length=150, command=update_preview)
 scale_global_thresh.set(0.65)
 scale_global_thresh.grid(row=0, column=1, padx=5)
+bind_scale_keys(scale_global_thresh, lambda v: update_preview())
 
 # 雜點過濾
 tk.Label(settings_frame, text="雜點過濾(px):").grid(row=1, column=0, padx=5, sticky="e")
@@ -889,8 +1198,54 @@ entry_turd.grid(row=1, column=1, sticky="w", padx=5)
 entry_turd.bind('<Return>', update_preview)
 
 centerline_var = tk.BooleanVar()
-chk_centerline = tk.Checkbutton(settings_frame, text="提取中心單線 (Python 內建)", variable=centerline_var)
+chk_centerline = tk.Checkbutton(settings_frame, text="提取中心單線 (Python 內建)", variable=centerline_var, command=update_preview)
 chk_centerline.grid(row=2, column=0, columnspan=2, pady=2, sticky="w")
+tk.Label(settings_frame, text="強度 (0=關)").grid(row=2, column=2, padx=5, sticky="w")
+
+erosion_var = tk.BooleanVar(value=False)
+chk_erosion = tk.Checkbutton(settings_frame, text="線條細化 (去除粗邊)", variable=erosion_var, command=update_preview)
+chk_erosion.grid(row=3, column=0, columnspan=2, pady=2, sticky="w", padx=(20, 0))
+scale_erosion_strength = tk.Scale(settings_frame, from_=0, to=4, resolution=1, orient=tk.HORIZONTAL, length=120, command=update_preview)
+scale_erosion_strength.set(1)
+scale_erosion_strength.grid(row=3, column=2, padx=5, sticky="w")
+
+smart_clean_var = tk.BooleanVar(value=False)
+chk_smart_clean = tk.Checkbutton(settings_frame, text="去除沾黏 (智慧修邊)", variable=smart_clean_var, command=update_preview)
+chk_smart_clean.grid(row=4, column=0, columnspan=2, pady=2, sticky="w", padx=(20, 0))
+scale_opening_strength = tk.Scale(settings_frame, from_=0, to=4, resolution=1, orient=tk.HORIZONTAL, length=120, command=update_preview)
+scale_opening_strength.set(1)
+scale_opening_strength.grid(row=4, column=2, padx=5, sticky="w")
+
+gap_closing_var = tk.BooleanVar(value=False)
+chk_gap_closing = tk.Checkbutton(settings_frame, text="連接鄰近線條 (平滑化)", variable=gap_closing_var, command=update_preview)
+chk_gap_closing.grid(row=5, column=0, columnspan=2, pady=2, sticky="w", padx=(20, 0))
+scale_gap_strength = tk.Scale(settings_frame, from_=0, to=4, resolution=1, orient=tk.HORIZONTAL, length=120, command=update_preview)
+scale_gap_strength.set(1)
+scale_gap_strength.grid(row=5, column=2, padx=5, sticky="w")
+
+# 超取樣設定
+tk.Label(settings_frame, text="品質(超取樣):").grid(row=6, column=0, padx=5, sticky="e")
+combo_scale = ttk.Combobox(settings_frame, values=["1x (標準)", "2x (高品質)", "3x (精細)", "4x (極致)"], state="readonly", width=12)
+combo_scale.current(0)
+combo_scale.grid(row=6, column=1, padx=5, sticky="w")
+
+def reset_parameters():
+    scale_global_thresh.set(0.65)
+    entry_turd.delete(0, tk.END)
+    entry_turd.insert(0, "2")
+    centerline_var.set(False)
+    erosion_var.set(False)
+    smart_clean_var.set(False)
+    gap_closing_var.set(False)
+    scale_erosion_strength.set(1)
+    scale_opening_strength.set(1)
+    scale_gap_strength.set(1)
+    combo_scale.current(0)
+    scale_local_thresh.set(0.45)
+    update_preview()
+
+btn_reset = tk.Button(settings_frame, text="重置參數", command=reset_parameters)
+btn_reset.grid(row=7, column=0, columnspan=2, pady=5)
 
 # --- 新增：局部調整控制區 ---
 roi_frame = tk.LabelFrame(root, text="局部區域調整 (ROI)", fg="blue")
@@ -903,10 +1258,8 @@ tk.Label(roi_frame, text="局部閾值:").pack(side=tk.LEFT, padx=5)
 scale_local_thresh = tk.Scale(roi_frame, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL, length=150, command=update_local_thresh)
 scale_local_thresh.set(0.45) # 預設比全域低一點，適合去除雜點
 scale_local_thresh.pack(side=tk.LEFT, padx=5)
+bind_scale_keys(scale_local_thresh, update_local_thresh)
 tk.Label(roi_frame, text="(框選時套用此值)").pack(side=tk.LEFT)
-
-btn_undo = tk.Button(roi_frame, text="復原上一個", command=undo_last_region)
-btn_undo.pack(side=tk.LEFT, padx=10)
 
 btn_delete_selected = tk.Button(roi_frame, text="刪除選取區域", command=delete_selected_region, state=tk.DISABLED)
 btn_delete_selected.pack(side=tk.LEFT, padx=5)

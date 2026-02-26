@@ -1,0 +1,15 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"type": "Live Preview",
+			"workspacePath": "c:\\Users\\Administrator\\Desktop\\ConvertTool",
+			"problemMatcher": [],
+			"label": "Live Preview: 執行伺服器",
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			}
+		}
+	]
+}
